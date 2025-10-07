@@ -1,12 +1,13 @@
 import polars as PL
+from ortools.sat.python import cp_model
 """
 version of the package
 """
-version='0.7'
+version='0.8'
 """
 date of this version of the package
 """
-date='2025-09-01'
+date='2025-10-07'
 class multipletsError(Exception):
   """Exception raised by package multiplets"""
   def __init__(self,method:str,text:str):
@@ -108,24 +109,24 @@ class multiplets:
         _multipletsWarning('_col',f'Argument {strorexpr} has unsupported type {type(strorexpr)}! Using 0 instead.')
         self._was_col_warning=True
       return PL.lit(0)
-  def init_edges(self,distance:'Expr|str|int|float'=0,filter:'Expr|int|float'=1,*,agg_horizontal:'function'=PL.sum_horizontal)->PL.DataFrame:
+  def init_edges(self,weight:'Expr|str|int|float'=0,filter:'Expr|int|float'=1,*,agg_horizontal:'function'=PL.sum_horizontal)->PL.DataFrame:
     """
     Initialize edges and hyperedges between vertices.
     
-    An undirected edge connects probands from different groups which satisfy the condition of parameter filter. The weight of an edge is given by parameter distance. The edges are stored as a dataframe in atribute edges.
+    An undirected edge connects probands from different groups which satisfy the condition of parameter filter. The weight of an edge is given by parameter weight. The edges are stored as a dataframe in atribute edges.
     
     A hyperedge connects only probands across all groups such that each pair of these probands is connected by an edge. The weight of a hyperedge is computed by function agg_horizontal applied to weights of all these edges.
     
-    The method returns a dataframe where each row represents one hyperedge, with column '_distance' representing a weight of this hyperedge. It is ensured that for the same input this dataframe will be the same. The returned dataframe is also stored in atribute hyperedges.
+    The method returns a dataframe where each row represents one hyperedge, with column '_weight' representing a weight of this hyperedge. It is ensured that for the same input this dataframe will be the same. The returned dataframe is also stored in atribute hyperedges.
     
     Parameters
     ----------
-    distance
-        The weight of an edge. It can be name of a column or expression made by other columns. If the original dataframe in multiplets.__init__ contains another columns then the names of these columns are suffixed by '_A' and '_B', respectively for the two probands connected by the edge. These suffixed column names can also be used in the expression.
-        The value of distance is temporarily stored in column '_distance'.
+    weight
+        The weight of an edge. It can be name of a column or expression made by other columns. If the original dataframe in multiplets.__init__ contains another columns then the names of these columns are suffixed by '_A' and '_B', respectively  for the two probands connected by the edge. These suffixed column names can also be used in the expression.
+        The value of weight is temporarily stored in column '_weight'.
     filter
         A condition which must be satisfied by all edges. If filter is some number x of type int or float then the condition is
-            pl.col('_distance')<=x
+            pl.col('_weight')<=x
     agg_horizontal
         An aggregation function used to compute weight of a hyperedge. This function is applied to weights of all edges contained in the hyperedge.
     
@@ -144,44 +145,44 @@ class multiplets:
            └──┴─────┴─────┘
     Then (assuming that package polars was imported as pl)
         mp=multiplets(df,'id','group')
-        mp.init_edges(distance=(pl.col('value_A')-pl.col('value_B')).abs(), filter=30)
+        mp.init_edges(weight=(pl.col('value_A')-pl.col('value_B')).abs(), filter=30)
     returns
-                      ┌────┬────┬────┬─────────┐
-                      │id_0┆id_1┆id_2┆_distance│
-        mp.hyperedges=╞════╪════╪════╪═════════╡
-                      │  2 ┆  3 ┆  5 ┆    60   │
-                      │  2 ┆  4 ┆  5 ┆    60   │
-                      └────┴────┴────┴─────────┘
+                      ┌────┬────┬────┬───────┐
+                      │id_0┆id_1┆id_2┆_weight│
+        mp.hyperedges=╞════╪════╪════╪═══════╡
+                      │  2 ┆  3 ┆  5 ┆   60  │
+                      │  2 ┆  4 ┆  5 ┆   60  │
+                      └────┴────┴────┴───────┘
     Here in the first row we have abs(20-30)+abs(20-50)+abs(30-50)=60.
     On the other hand,
         mp=multiplets(df,'id','group')
-        mp.init_edges(distance=(pl.col('value_A')-pl.col('value_B')).abs(), filter=30,
+        mp.init_edges(weight=(pl.col('value_A')-pl.col('value_B')).abs(), filter=30,
             agg_horizontal=pl.max_horizontal)
     returns
-                      ┌────┬────┬────┬─────────┐
-                      │id_0┆id_1┆id_2┆_distance│
-        mp.hyperedges=╞════╪════╪════╪═════════╡
-                      │  2 ┆  3 ┆  5 ┆    30   │
-                      │  2 ┆  4 ┆  5 ┆    30   │
-                      └────┴────┴────┴─────────┘
+                      ┌────┬────┬────┬───────┐
+                      │id_0┆id_1┆id_2┆_weight│
+        mp.hyperedges=╞════╪════╪════╪═══════╡
+                      │  2 ┆  3 ┆  5 ┆   30  │
+                      │  2 ┆  4 ┆  5 ┆   30  │
+                      └────┴────┴────┴───────┘
     Here in the first row we have max(abs(20-30),abs(20-50),abs(30-50))=30.
     """
     if not self.init_OK:
       raise multipletsError('init_edges','Instance is not initialized correctly! Exiting.')
     if isinstance(filter,(int,float)):
-      filter=(PL.col('_distance')<=filter)
+      filter=(PL.col('_weight')<=filter)
     self.edges={}
     for i in range(len(self.part_keys)-1):
       for j in range(i+1,len(self.part_keys)):
         self.edges[i,j]=(
           self.vertices[self.part_keys[i]].select(PL.all().name.suffix('_A'))
             .join(self.vertices[self.part_keys[j]].select(PL.all().name.suffix('_B')), how='cross')
-            .with_columns(self._col(distance).alias('_distance'))
+            .with_columns(self._col(weight).alias('_weight'))
             .filter(filter)
             .select(
               PL.col(f'{self.colname_id}_A').alias(f'{self.colname_id}_{i}'),
               PL.col(f'{self.colname_id}_B').alias(f'{self.colname_id}_{j}'),
-              PL.col('_distance').alias(f'_distance_{i}_{j}')))
+              PL.col('_weight').alias(f'_weight_{i}_{j}')))
     first_join=True
     for i in range(len(self.part_keys)-1):
       for j in range(i+1,len(self.part_keys)):
@@ -192,7 +193,7 @@ class multiplets:
           self.hyperedges=self.hyperedges.join(
             self.edges[i,j], on=[f'{self.colname_id}_{i}', f'{self.colname_id}_{j}'][:i+1], how='inner')
     self.hyperedges=(self.hyperedges
-      .select(f'^{self.colname_id}_.*$', agg_horizontal(f'^_distance_.*$').alias('_distance'))
+      .select(f'^{self.colname_id}_.*$', agg_horizontal(f'^_weight_.*$').alias('_weight'))
       .sort([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]))
     return self.hyperedges
   def join(self,left_df:PL.DataFrame,right_df:PL.DataFrame,right_on:'str|NoneType'=None)->PL.DataFrame:
@@ -291,86 +292,51 @@ class multiplets:
         t.drop([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]),
         on='multiplet_id', how='left')
     return res
-  def _find_one_set(self,df:PL.DataFrame)->PL.DataFrame:
-    """
-    Find one set of multiplets, using greedy algorithm on df.
-    
-    Parameter
-    ---------
-    df
-        A dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. The id's must be in the form 'id_0', 'id_1' etc. where 'id' is the name of the id column used in the constructor.
-    """
-    res=[]
-    while df.height:
-      res.append(df[0])
-      df=df.filter([
-        PL.col(f'{self.colname_id}_{i}')!=PL.col(f'{self.colname_id}_{i}').first()
-        for i in range(len(self.part_keys))])
-    return PL.concat(res)
-  def find_multiplets(self,df:PL.DataFrame,*,attempts:int=10,preference:'Expr|str|int|float'=0,agg:'function'=PL.sum,as_dict:'bool|int'=False,verbose:int=0):
+  def find_multiplets(self,df:'PL.DataFrame|NoneType'=None,*,weight='_weight',verbose:int=0):
     """
     Try to find the best set of multiplets from a given set of possible multiplets.
     
-    The method runs the given number of attempts and in each attempt
-        - the dataframe is sorted according to preference and the rows with equal preference are sorted randomly,
-        - method _find_one_set is used with this sorted dataframe to find one set of multiplets,
-        - the weight of the set is computed as the sum (or other function) of weights of hyperedges in the set.
-    
-    The method returns the set with the most hyperedges and in the case of a tie, with the smallest weight. The returned set is represented by a dataframe where each row represents a multiplet.
-    
-    The method returns a different set each time. For a reproducible result one must use method polars.set_random_seed.
+    The method returns the set with the most hyperedges and in the case of a tie, with the smallest total weight. The returned set is represented by a dataframe where each row represents a multiplet.
     
     Parameters
     ----------
     df
         A dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. The id's must be in the form 'id_0', 'id_1' etc. where 'id' is the name of the id column used in the constructor.
-    attempts
-        The number of calls of method _find_one_set. Implicite value is 10. More attempts take more time and can lead to better results.
-    preference
-        Expression or name of column or number, according to which the dataframe df is partially sorted (for each call of method _find_one_set, the rows with equal preference are sorted randomly). Smaller values of preference are preferred, i.e. the multiplets with the smallest value of preference are chosen first.
-        If preference has all values unique then randomization does not influence the sorting and value attempts>1 does not make sense.
-        Implicitely the preference is constant,thus no multiplets are preferred and the whole dataframe is sorted randomly.
-    agg
-        An aggregation function used to compute weight of a set of hyperedges. This function is applied to weights of all hyperedges contained in the set.
-    as_dict
-        If as_dict=False then only the set of hyperedges as was written above.
-        If as_dict=True then the method returns a dictionary. In the dictionary, key is a cardinality and value is the best found set with this cardinality.
-        If as_dict is integer x then the method returns a dictionary with x highest cardinalities.
-        Implicitely as_dict=False.
+        The dataframe should contain column given by parameter weight.
+        Implicitely df=None which means that self.hyperedges is used.
+    weight
+        Name of the column, with respect to which the minimization will be done.
+        In the case that the dataframe does not contain this column, then this column is filled with zeroes.
     verbose
         If verbose>0 then the information about currently the best sets is printed.
         Implicitely verbose=0.
     """
     if not self.init_OK:
       raise multipletsError('find_multiplets','Instance is not initialized correctly! Exiting.')
-    df=df.with_columns(self._col(preference).alias('_preference'))
-    if as_dict:
-      best_t={}
-      best_d={}
-    for i in range(attempts):
-      t=self._find_one_set(
-        df.with_row_index('_rnd').with_columns(PL.col('_rnd').shuffle()).sort('_preference','_rnd'))
-      h=t.height
-      d=t.select(agg('_distance')).item()
-      if as_dict:
-        if (h not in best_d) or (d<best_d[h]):
-          best_t[h]=t
-          best_d[h]=d
-          if verbose>0:
-            print(f'{[i,h,d,d/h]=}')
-      else:
-        if (i==0) or ((-h,d)<(-best_h,best_d)):
-          best_t=t
-          best_h=h
-          best_d=d
-          if verbose>0:
-            print(f'{[i,h,d,d/h]=}')
-    if as_dict:
-      if type(as_dict)==int:
-        for h in sorted(list(best_t),reverse=True)[as_dict:]:
-          best_t.pop(h)
-      for h in best_t.keys():
-        best_t[h]=best_t[h].drop('_preference','_rnd')
+    if df is None:
+      df=self.hyperedges
+    if weight not in df.columns:
+      df=df.with_columns(pl.lit(0).alias(weight))
+    self.model=cp_model.CpModel()
+    self.x=[self.model.new_int_var(0,1,f'x{i}') for i in range(df.height)]
+    t=self.unpivot(df).group_by(self.colname_id).agg('multiplet_id')
+    for i in range(t.height):
+      self.model.add(sum(self.x[j] for j in t.item(i,1))<=1)
+    C=df.select(weight).max().item()*min(d.height for d in self.vertices.values())+1
+    self.model.maximize(sum((C-w)*self.x[i] for i,w in enumerate(df.get_column(weight))))
+    self.solver=cp_model.CpSolver()
+    self.status=self.solver.solve(self.model)
+    if self.status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+      self.multiplets=PL.concat(df[i] for i in range(len(self.x)) if self.solver.value(self.x[i]))
+      if verbose>=1:
+        print(f'Maximum of objective function: {self.solver.objective_value}')
     else:
-      best_t=best_t.drop('_preference','_rnd')
-    return best_t
+      self.multiplets=df.head(0)
+      if verbose>=1:
+        print("No solution found.")
+    if verbose>=1:
+      print(f"  status   : {self.solver.status_name(self.status)}")
+      print(f"  conflicts: {self.solver.num_conflicts}")
+      print(f"  branches : {self.solver.num_branches}")
+      print(f"  wall time: {self.solver.wall_time} s")
+    return self.multiplets
