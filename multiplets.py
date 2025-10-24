@@ -1,13 +1,14 @@
 import polars as PL
 from ortools.sat.python import cp_model
+from ortools.graph.python import linear_sum_assignment
 """
 version of the package
 """
-version='0.8'
+version='0.9'
 """
 date of this version of the package
 """
-date='2025-10-07'
+date='2025-10-24'
 class multipletsError(Exception):
   """Exception raised by package multiplets"""
   def __init__(self,method:str,text:str):
@@ -25,6 +26,18 @@ class multipletsError(Exception):
     self.text=text
   def __str__(self)->str:
     return f'{self.method}: {self.text}'
+class multipletsErrorNoSolution(multipletsError):
+  """Exception raised by package multiplets when no solution is found"""
+  def __init__(self,text:str):
+    """
+    Initialize the exception.
+    
+    Parameter
+    ---------
+    text
+        Text of the exception.
+    """
+    super().__init__('find_multiplets',text)
 class _multipletsWarning():
   """Warning issued by package multiplets"""
   def __init__(self,method:str,text:str):
@@ -45,20 +58,22 @@ class _multipletsWarning():
     return f'{self.method}: {self.text}'
 class multiplets:
   """The main class for generating a set of multiplets"""
-  def __init__(self,df:PL.DataFrame,id:str,group:str,*,check_too_big:bool=True):
+  def __init__(self,df:PL.DataFrame,id:str,group:str,*,check_too_big:bool=True,colname_rowid:str='_rowid'):
     """
     Initialize the data structures. Partition vertices into groups.
     
     Parameters
     ----------
     df
-        Dataframe containing columns id and group where each row represents one proband. Dataframe can contain another columns and they can be used when generating the multiplets.
+        Dataframe containing columns id and group where each row represents one person. Dataframe can contain another columns and they can be used when generating the multiplets.
     id
-        Name of the column containing the proband identifiers. Values in this column must be unique.
+        Name of the column containing the personal identifiers. Values in this column must be nonempty and unique.
     group
-        Name of the colums which contains values, according to which the set of probands is split into groups.
+        Name of the column which contains values, according to which the set of persons is split into groups.
     check_too_big
         If check_too_big is True and the column group has more than 10 values then the constructor raises an error. This can happen when there is some user mistake.
+    colname_rowid
+        Name of a column which is used for internal manipulation with dataframes.
     """
     self.init_OK=False
     if df.height==0:
@@ -71,8 +86,9 @@ class multiplets:
       self.colname_group=group
     else:
       raise multipletsError('__init__',f'Dataframe does not contain column {group}! Exiting.')
-    if df.select(id).height!=df.select(id).unique().height:
-      raise multipletsError('__init__',f'Values in column {id} are not unique! Exiting.')
+    if df.select(id).height!=df.select(id).unique().drop_nulls().height:
+      raise multipletsError('__init__',f'Values in column {id} are not nonemply and unique! Exiting.')
+    self.colname_rowid=colname_rowid
     self.vertices=df.partition_by(group,include_key=False,as_dict=True)
     t=list(self.vertices.keys())
     if (None,) in t:
@@ -84,6 +100,9 @@ class multiplets:
       raise multipletsError('__init__',f'Partition by {group} has only one part! Exiting.')
     elif (len(self.part_keys)>10) and check_too_big:
       raise multipletsError('__init__',f'Partition by {group} has too much ({len(self.part_keys)}) parts! Exiting.')
+    if len(self.part_keys)==2:
+      for k in self.vertices:
+        self.vertices[k]=self.vertices[k].with_row_index(self.colname_rowid)
     self._was_col_warning=False
     self.init_OK=True
   def _col(self,strorexpr:'Expr|str|int|float')->'Expr':
@@ -109,30 +128,33 @@ class multiplets:
         _multipletsWarning('_col',f'Argument {strorexpr} has unsupported type {type(strorexpr)}! Using 0 instead.')
         self._was_col_warning=True
       return PL.lit(0)
-  def init_edges(self,weight:'Expr|str|int|float'=0,filter:'Expr|int|float'=1,*,agg_horizontal:'function'=PL.sum_horizontal)->PL.DataFrame:
+  def init_edges(self,weight:'Expr|str|int|float'=0,filter:'Expr|int|float|NoneType'=None,*,agg_horizontal:'function'=PL.sum_horizontal,colname_weight:str='_weight')->PL.DataFrame:
     """
     Initialize edges and hyperedges between vertices.
     
-    An undirected edge connects probands from different groups which satisfy the condition of parameter filter. The weight of an edge is given by parameter weight. The edges are stored as a dataframe in atribute edges.
+    An undirected edge connects persons from different groups which satisfy the condition of parameter filter. The weight of an edge is given by parameter weight. The edges are stored as a dataframe in atribute edges.
     
-    A hyperedge connects only probands across all groups such that each pair of these probands is connected by an edge. The weight of a hyperedge is computed by function agg_horizontal applied to weights of all these edges.
+    A hyperedge connects only persons across all groups such that each pair of these persons is connected by an edge. The weight of a hyperedge is computed by function agg_horizontal applied to weights of all these edges.
     
     The method returns a dataframe where each row represents one hyperedge, with column '_weight' representing a weight of this hyperedge. It is ensured that for the same input this dataframe will be the same. The returned dataframe is also stored in atribute hyperedges.
     
     Parameters
     ----------
     weight
-        The weight of an edge. It can be name of a column or expression made by other columns. If the original dataframe in multiplets.__init__ contains another columns then the names of these columns are suffixed by '_A' and '_B', respectively  for the two probands connected by the edge. These suffixed column names can also be used in the expression.
+        The weight of an edge. It can be name of a column or expression made by other columns. If the original dataframe in multiplets.__init__ contains another columns then the names of these columns are suffixed by '_A' and '_B', respectively  for the two persons connected by the edge. These suffixed column names can also be used in the expression.
         The value of weight is temporarily stored in column '_weight'.
     filter
         A condition which must be satisfied by all edges. If filter is some number x of type int or float then the condition is
             pl.col('_weight')<=x
+        Implicitely None which means that no filter is applied.
     agg_horizontal
         An aggregation function used to compute weight of a hyperedge. This function is applied to weights of all edges contained in the hyperedge.
+    colname_weight
+        Name of a column which is used for internal manipulation with dataframes.
     
     Example
     -------
-    Suppose that the probands are in dataframe
+    Suppose that the persons are in dataframe
            ┌──┬─────┬─────┐
            │id┆group┆value│
         df=╞══╪═════╪═════╡
@@ -166,23 +188,54 @@ class multiplets:
                       │  2 ┆  4 ┆  5 ┆   30  │
                       └────┴────┴────┴───────┘
     Here in the first row we have max(abs(20-30),abs(20-50),abs(30-50))=30.
+    
+    Example
+    -------
+    In the case that there are only two groups, dataframe mp.hyperedges contains also columns '_rowid_0' and '_rowid_1' which are used later for faster search.
+    Suppose that the persons are in dataframe
+           ┌──┬─────┬─────┐
+           │id┆group┆value│
+        df=╞══╪═════╪═════╡
+           │ 1┆ 'D' ┆  10 │
+           │ 2┆ 'D' ┆  20 │
+           │ 3┆ 'E' ┆  30 │
+           │ 4┆ 'E' ┆  40 │
+           └──┴─────┴─────┘
+    Then (assuming that package polars was imported as pl)
+        mp=multiplets(df,'id','group')
+        mp.init_edges(weight=(pl.col('value_A')-pl.col('value_B')).abs(), filter=20)
+    returns
+                      ┌────────┬────────┬────┬────┬───────┐
+                      │_rowid_0┆_rowid_1┆id_0┆id_1┆_weight│
+        mp.hyperedges=╞════════╪════════╪════╪════╪═══════╡
+                      │    0   ┆    0   ┆  1 ┆  3 ┆   20  │
+                      │    1   ┆    0   ┆  2 ┆  3 ┆   10  │
+                      │    1   ┆    1   ┆  2 ┆  4 ┆   20  │
+                      └────────┴────────┴────┴────┴───────┘
+    Here in the first row we have abs(10-30)=20.
     """
     if not self.init_OK:
       raise multipletsError('init_edges','Instance is not initialized correctly! Exiting.')
-    if isinstance(filter,(int,float)):
-      filter=(PL.col('_weight')<=filter)
+    self.colname_weight=colname_weight
+    if filter is None:
+      filter=True
+    elif isinstance(filter,(int,float)):
+      filter=(PL.col(self.colname_weight)<=filter)
     self.edges={}
     for i in range(len(self.part_keys)-1):
       for j in range(i+1,len(self.part_keys)):
         self.edges[i,j]=(
           self.vertices[self.part_keys[i]].select(PL.all().name.suffix('_A'))
             .join(self.vertices[self.part_keys[j]].select(PL.all().name.suffix('_B')), how='cross')
-            .with_columns(self._col(weight).alias('_weight'))
+            .with_columns(self._col(weight).alias(self.colname_weight))
             .filter(filter)
             .select(
-              PL.col(f'{self.colname_id}_A').alias(f'{self.colname_id}_{i}'),
-              PL.col(f'{self.colname_id}_B').alias(f'{self.colname_id}_{j}'),
-              PL.col('_weight').alias(f'_weight_{i}_{j}')))
+              ([PL.col(f'{self.colname_rowid}_A').alias(f'{self.colname_rowid}_{i}'),
+                  PL.col(f'{self.colname_rowid}_B').alias(f'{self.colname_rowid}_{j}')]
+                if len(self.part_keys)==2 else [])+
+              [PL.col(f'{self.colname_id}_A').alias(f'{self.colname_id}_{i}'),
+                PL.col(f'{self.colname_id}_B').alias(f'{self.colname_id}_{j}'),
+                PL.col(self.colname_weight).alias(f'{self.colname_weight}_{i}_{j}')]))
     first_join=True
     for i in range(len(self.part_keys)-1):
       for j in range(i+1,len(self.part_keys)):
@@ -193,7 +246,9 @@ class multiplets:
           self.hyperedges=self.hyperedges.join(
             self.edges[i,j], on=[f'{self.colname_id}_{i}', f'{self.colname_id}_{j}'][:i+1], how='inner')
     self.hyperedges=(self.hyperedges
-      .select(f'^{self.colname_id}_.*$', agg_horizontal(f'^_weight_.*$').alias('_weight'))
+      .select(
+        ([f'^{self.colname_rowid}_.*$'] if len(self.part_keys)==2 else [])+
+        [f'^{self.colname_id}_.*$', agg_horizontal(f'^{self.colname_weight}_.*$').alias(self.colname_weight)])
       .sort([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]))
     return self.hyperedges
   def join(self,left_df:PL.DataFrame,right_df:PL.DataFrame,right_on:'str|NoneType'=None)->PL.DataFrame:
@@ -205,7 +260,7 @@ class multiplets:
     left_df
         A dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. The id's must be in the form 'id_0', 'id_1' etc. where 'id' is the name of the id column used in the constructor.
     right_df
-        A dataframe where each row represents a proband, with vertical id's and possibly some other columns.
+        A dataframe where each row represents a person, with vertical id's and possibly some other columns.
     right_on
         Name of the column in right_df which contains the id's.
     
@@ -242,14 +297,14 @@ class multiplets:
     return res
   def unpivot(self,df:PL.DataFrame,*,all_columns:bool=False)->PL.DataFrame:
     """
-    Unpivot a dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. In the returned dataframe each row represents a proband, the dataframe contains vertical id's, position in the multiplets (column named 'multiplet_id' and column named in the same way as 'group' in the constructor) and possibly the other columns.
+    Unpivot a dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. In the returned dataframe each row represents a person, the dataframe contains vertical id's, position in the multiplets (column named 'multiplet_id' and column named in the same way as 'group' in the constructor) and possibly the other columns.
     
     Parameters
     ----------
     df
         A dataframe where each row represents a multiplet, with horizontal id's and possibly some other columns. The id's must be in the form 'id_0', 'id_1' etc. where 'id' is the name of the id column used in the constructor.
     all_columns
-        If set to True then values in the other columns will be copied fror a multiplet to each its proband.
+        If set to True then values in the other columns will be copied fror a multiplet to each its person.
     
     Example
     -------
@@ -292,7 +347,7 @@ class multiplets:
         t.drop([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]),
         on='multiplet_id', how='left')
     return res
-  def find_multiplets(self,df:'PL.DataFrame|NoneType'=None,*,weight='_weight',verbose:int=0):
+  def find_multiplets(self,df:'PL.DataFrame|NoneType'=None,*,weight='_weight',penalty:'int|float|NoneType'=None,force_CPSAT:bool=False,verbose:int=0):
     """
     Try to find the best set of multiplets from a given set of possible multiplets.
     
@@ -307,6 +362,15 @@ class multiplets:
     weight
         Name of the column, with respect to which the minimization will be done.
         In the case that the dataframe does not contain this column, then this column is filled with zeroes.
+    penalty
+        Penalty added to the total weight in the case that the set of multiplets does not cover the smallest group.
+        The penalty is added for every one person from the smallest group which is not covered by the multiplets.
+        Implicitely penalty=None which means that the algorithm looks for the maximal number of multiplets, and for this number of multiplets the algorithm looks for the set of multiplets with the smallest total weight.
+    force_CPSAT
+        For more than two groups, algorithm CPSAT is used for searching.
+        Also for two groups and force_CPSAT=True, algorithm CPSAT is used.
+        Implicitely force_CPSAT=False which means that for two groups, algorithm LSA is used.
+        Algorithm LSA is much faster, but it works only for two groups and for integer values of weights.
     verbose
         If verbose>0 then the information about currently the best sets is printed.
         Implicitely verbose=0.
@@ -317,26 +381,83 @@ class multiplets:
       df=self.hyperedges
     if weight not in df.columns:
       df=df.with_columns(pl.lit(0).alias(weight))
-    self.model=cp_model.CpModel()
-    self.x=[self.model.new_int_var(0,1,f'x{i}') for i in range(df.height)]
-    t=self.unpivot(df).group_by(self.colname_id).agg('multiplet_id')
-    for i in range(t.height):
-      self.model.add(sum(self.x[j] for j in t.item(i,1))<=1)
-    C=df.select(weight).max().item()*min(d.height for d in self.vertices.values())+1
-    self.model.maximize(sum((C-w)*self.x[i] for i,w in enumerate(df.get_column(weight))))
-    self.solver=cp_model.CpSolver()
-    self.status=self.solver.solve(self.model)
-    if self.status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-      self.multiplets=PL.concat(df[i] for i in range(len(self.x)) if self.solver.value(self.x[i]))
+    if penalty is None:
+      penalty=int(df.select(weight).max().item()*min(d.height for d in self.vertices.values())+3)
+    if force_CPSAT or (len(self.part_keys)>=3):
+      self.model_type='CPSAT'
+      self.model=cp_model.CpModel()
+      self.x=[self.model.new_int_var(0,1,f'x{i}') for i in range(df.height)]
+      t=self.unpivot(df).group_by(self.colname_id).agg('multiplet_id')
+      for i in range(t.height):
+        self.model.add(sum(self.x[j] for j in t.item(i,1))<=1)
+      self.model.maximize(sum((penalty-w)*self.x[i] for i,w in enumerate(df.get_column(weight))))
+      self.solver=cp_model.CpSolver()
+      self.status=self.solver.solve(self.model)
       if verbose>=1:
-        print(f'Maximum of objective function: {self.solver.objective_value}')
+        print(f'  status   : {self.solver.status_name(self.status)}')
+        print(f'  conflicts: {self.solver.num_conflicts}')
+        print(f'  branches : {self.solver.num_branches}')
+        print(f'  wall time: {self.solver.wall_time} s')
+      if self.status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        self.multiplets=PL.concat(df[i] for i in range(len(self.x)) if self.solver.value(self.x[i]))
+        if verbose>=1:
+          print(f'Maximum of objective function: {self.solver.objective_value}')
+      else:
+        self.multiplets=df.head(0)
+        if verbose>=1:
+          print('No solution found!')
+        raise multipletsErrorNoSolution('No solution found!')
     else:
-      self.multiplets=df.head(0)
-      if verbose>=1:
-        print("No solution found.")
-    if verbose>=1:
-      print(f"  status   : {self.solver.status_name(self.status)}")
-      print(f"  conflicts: {self.solver.num_conflicts}")
-      print(f"  branches : {self.solver.num_branches}")
-      print(f"  wall time: {self.solver.wall_time} s")
+      self.model_type='LSA'
+      heights=[self.vertices[self.part_keys[i]].height for i in range(2)]
+      def rangedf(a0,b0,a1,b1,w):
+        return (PL.DataFrame({f'{self.colname_rowid}_0':range(a0,b0)})
+          .join(PL.DataFrame({f'{self.colname_rowid}_1':range(a1,b1)}), how='cross')
+          .with_columns(PL.lit(w).alias(weight)))
+      df=(PL.concat(
+          [df]+
+          ([rangedf(heights[0],heights[1],0,heights[1],0)] if heights[0]<heights[1] else
+            [rangedf(0,heights[0],heights[1],heights[0],0)] if heights[1]<heights[0] else [])+
+          [rangedf(max(heights),sum(heights),0,heights[1],penalty/2),
+            rangedf(0,heights[0],max(heights),sum(heights),penalty/2),
+            PL.DataFrame({
+              f'{self.colname_rowid}_0':range(max(heights),sum(heights)),
+              f'{self.colname_rowid}_1':range(max(heights),sum(heights)),
+              weight:0})],
+          how='diagonal_relaxed')
+        .with_columns(PL.col(weight).cast(PL.Int64)))
+      if verbose>=2:
+        PL.Config.set_tbl_rows(100)
+        print(f'{df=}')
+        PL.Config.set_tbl_rows(10)
+      self.assignment=linear_sum_assignment.SimpleLinearSumAssignment()
+      self.assignment.add_arcs_with_cost(
+        df.get_column(f'{self.colname_rowid}_0'),
+        df.get_column(f'{self.colname_rowid}_1'),
+        df.get_column(weight))
+      self.status=self.assignment.solve()
+      if self.status==self.assignment.OPTIMAL:
+        self.multiplets=(
+          PL.DataFrame({f'{self.colname_rowid}_0':range(self.assignment.num_nodes()),
+            f'{self.colname_rowid}_1':(self.assignment.right_mate(i) for i in range(self.assignment.num_nodes()))})
+          .join(df, on=[f'{self.colname_rowid}_0',f'{self.colname_rowid}_1'], how='left')
+          .drop_nulls([f'{self.colname_id}_0',f'{self.colname_id}_1'])
+          .select(f'{self.colname_id}_0',f'{self.colname_id}_1',weight))
+        if verbose>=2:
+          PL.Config.set_tbl_rows(100)
+          print(f'{self.multiplets=}')
+          PL.Config.set_tbl_rows(10)
+        if verbose>=1:
+          print(f'Maximum of objective function: {self.assignment.optimal_cost()}')
+          print(f'Total weight: {self.multiplets.select(weight).sum().item()}')
+      elif self.status==assignment.INFEASIBLE:
+        self.multiplets=df.head(0)
+        if verbose>=1:
+          print('No assignment is possible!')
+        raise multipletsErrorNoSolution('No assignment is possible!')
+      elif status == assignment.POSSIBLE_OVERFLOW:
+        self.multiplets=df.head(0)
+        if verbose>=1:
+          print('Some input costs are too large and may cause an integer overflow!')
+        raise multipletsErrorNoSolution('Some input costs are too large and may cause an integer overflow!')
     return self.multiplets
