@@ -4,11 +4,11 @@ from ortools.graph.python import linear_sum_assignment
 """
 version of the package
 """
-version='0.9'
+version='1.0'
 """
 date of this version of the package
 """
-date='2025-10-24'
+date='2025-10-29'
 class multipletsError(Exception):
   """Exception raised by package multiplets"""
   def __init__(self,method:str,text:str):
@@ -247,8 +247,11 @@ class multiplets:
             self.edges[i,j], on=[f'{self.colname_id}_{i}', f'{self.colname_id}_{j}'][:i+1], how='inner')
     self.hyperedges=(self.hyperedges
       .select(
-        ([f'^{self.colname_rowid}_.*$'] if len(self.part_keys)==2 else [])+
-        [f'^{self.colname_id}_.*$', agg_horizontal(f'^{self.colname_weight}_.*$').alias(self.colname_weight)])
+        ([f'{self.colname_rowid}_{i}' for i in range(len(self.part_keys))] if len(self.part_keys)==2 else [])+
+        [f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]+
+        [agg_horizontal(f'{self.colname_weight}_{i}_{j}'
+            for i in range(len(self.part_keys)-1) for j in range(i+1,len(self.part_keys))
+          ).alias(self.colname_weight)])
       .sort([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]))
     return self.hyperedges
   def join(self,left_df:PL.DataFrame,right_df:PL.DataFrame,right_on:'str|NoneType'=None)->PL.DataFrame:
@@ -347,11 +350,13 @@ class multiplets:
         t.drop([f'{self.colname_id}_{i}' for i in range(len(self.part_keys))]),
         on='multiplet_id', how='left')
     return res
-  def find_multiplets(self,df:'PL.DataFrame|NoneType'=None,*,weight='_weight',penalty:'int|float|NoneType'=None,force_CPSAT:bool=False,verbose:int=0):
+  def find_multiplets(self,df:'PL.DataFrame|NoneType'=None,*,weight='_weight',multiplier:'int|float|NoneType'=None,penalty:'int|float|NoneType'=None,force_CPSAT:bool=False,max_time:'int|float|NoneType'=None,verbose:int=0):
     """
     Try to find the best set of multiplets from a given set of possible multiplets.
     
     The method returns the set with the most hyperedges and in the case of a tie, with the smallest total weight. The returned set is represented by a dataframe where each row represents a multiplet.
+    
+    Usually there is more than one optimal solution. In this case, each execution of find_multiplets can return a different set of multiplets.
     
     Parameters
     ----------
@@ -362,6 +367,9 @@ class multiplets:
     weight
         Name of the column, with respect to which the minimization will be done.
         In the case that the dataframe does not contain this column, then this column is filled with zeroes.
+    multiplier
+        In algorithm LSA, the weights are multiplied by this number before conversion to integers.
+        Implicitely multiplier=1.
     penalty
         Penalty added to the total weight in the case that the set of multiplets does not cover the smallest group.
         The penalty is added for every one person from the smallest group which is not covered by the multiplets.
@@ -371,8 +379,12 @@ class multiplets:
         Also for two groups and force_CPSAT=True, algorithm CPSAT is used.
         Implicitely force_CPSAT=False which means that for two groups, algorithm LSA is used.
         Algorithm LSA is much faster, but it works only for two groups and for integer values of weights.
+    max_time
+        Algorithm CPSAT will be interrupted after this number of seconds.
+        Implicitely max_time=None which means that the algorithm will not be interrupted.
     verbose
-        If verbose>0 then the information about currently the best sets is printed.
+        If verbose>=1 then some detailed information about the solution is printed.
+        If verbose>=2 then the information about currently the best sets is printed.
         Implicitely verbose=0.
     """
     if not self.init_OK:
@@ -384,6 +396,10 @@ class multiplets:
     if penalty is None:
       penalty=int(df.select(weight).max().item()*min(d.height for d in self.vertices.values())+3)
     if force_CPSAT or (len(self.part_keys)>=3):
+      if force_CPSAT and (len(self.part_keys)>=3):
+        _multipletsWarning('find_multiplets','Argument force_CPSAT is not used for more than two groups.')
+      if multiplier is not None:
+        _multipletsWarning('find_multiplets','Argument multiplier is not used for algorithm CPSAT.')
       self.model_type='CPSAT'
       self.model=cp_model.CpModel()
       self.x=[self.model.new_int_var(0,1,f'x{i}') for i in range(df.height)]
@@ -392,23 +408,38 @@ class multiplets:
         self.model.add(sum(self.x[j] for j in t.item(i,1))<=1)
       self.model.maximize(sum((penalty-w)*self.x[i] for i,w in enumerate(df.get_column(weight))))
       self.solver=cp_model.CpSolver()
-      self.status=self.solver.solve(self.model)
+      if max_time is not None:
+        self.solver.parameters.max_time_in_seconds=max_time
+      if verbose>=2:
+        self.status=self.solver.solve(self.model,cp_model.ObjectiveSolutionPrinter())
+      else:
+        self.status=self.solver.solve(self.model)
       if verbose>=1:
         print(f'  status   : {self.solver.status_name(self.status)}')
         print(f'  conflicts: {self.solver.num_conflicts}')
         print(f'  branches : {self.solver.num_branches}')
         print(f'  wall time: {self.solver.wall_time} s')
       if self.status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        self.multiplets=PL.concat(df[i] for i in range(len(self.x)) if self.solver.value(self.x[i]))
         if verbose>=1:
           print(f'Maximum of objective function: {self.solver.objective_value}')
+        for i in range(len(self.x)):
+          if self.solver.value(self.x[i]):
+            self.multiplets=PL.concat(df[i] for i in range(len(self.x)) if self.solver.value(self.x[i]))
+            break
+        else:
+          self.multiplets=df.head(0)
+          _multipletsWarning('find_multiplets','The solution has zero multiplets.')
       else:
         self.multiplets=df.head(0)
         if verbose>=1:
           print('No solution found!')
         raise multipletsErrorNoSolution('No solution found!')
     else:
+      if max_time is not None:
+        _multipletsWarning('find_multiplets','Argument max_time is not used for algorithm LSA.')
       self.model_type='LSA'
+      if multiplier is None:
+        multiplier=1
       heights=[self.vertices[self.part_keys[i]].height for i in range(2)]
       def rangedf(a0,b0,a1,b1,w):
         return (PL.DataFrame({f'{self.colname_rowid}_0':range(a0,b0)})
@@ -424,8 +455,7 @@ class multiplets:
               f'{self.colname_rowid}_0':range(max(heights),sum(heights)),
               f'{self.colname_rowid}_1':range(max(heights),sum(heights)),
               weight:0})],
-          how='diagonal_relaxed')
-        .with_columns(PL.col(weight).cast(PL.Int64)))
+          how='diagonal_relaxed'))
       if verbose>=2:
         PL.Config.set_tbl_rows(100)
         print(f'{df=}')
@@ -434,7 +464,7 @@ class multiplets:
       self.assignment.add_arcs_with_cost(
         df.get_column(f'{self.colname_rowid}_0'),
         df.get_column(f'{self.colname_rowid}_1'),
-        df.get_column(weight))
+        (df.get_column(weight)*multiplier).cast(PL.Int64))
       self.status=self.assignment.solve()
       if self.status==self.assignment.OPTIMAL:
         self.multiplets=(
@@ -450,12 +480,12 @@ class multiplets:
         if verbose>=1:
           print(f'Maximum of objective function: {self.assignment.optimal_cost()}')
           print(f'Total weight: {self.multiplets.select(weight).sum().item()}')
-      elif self.status==assignment.INFEASIBLE:
+      elif self.status==self.assignment.INFEASIBLE:
         self.multiplets=df.head(0)
         if verbose>=1:
           print('No assignment is possible!')
         raise multipletsErrorNoSolution('No assignment is possible!')
-      elif status == assignment.POSSIBLE_OVERFLOW:
+      elif self.status==self.assignment.POSSIBLE_OVERFLOW:
         self.multiplets=df.head(0)
         if verbose>=1:
           print('Some input costs are too large and may cause an integer overflow!')
