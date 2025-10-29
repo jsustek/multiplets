@@ -394,7 +394,7 @@ class multiplets:
     if weight not in df.columns:
       df=df.with_columns(pl.lit(0).alias(weight))
     if penalty is None:
-      penalty=int(df.select(weight).max().item()*min(d.height for d in self.vertices.values())+3)
+      penalty=int(df.select(weight).max().item()+3)
     if force_CPSAT or (len(self.part_keys)>=3):
       if force_CPSAT and (len(self.part_keys)>=3):
         _multipletsWarning('find_multiplets','Argument force_CPSAT is not used for more than two groups.')
