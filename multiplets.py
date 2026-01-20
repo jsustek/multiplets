@@ -392,7 +392,7 @@ class multiplets:
     if df is None:
       df=self.hyperedges
     if weight not in df.columns:
-      df=df.with_columns(pl.lit(0).alias(weight))
+      df=df.with_columns(PL.lit(0).alias(weight))
     if penalty is None:
       penalty=int(df.select(weight).max().item()+3)
     if force_CPSAT or (len(self.part_keys)>=3):
